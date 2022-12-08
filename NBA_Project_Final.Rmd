@@ -1,0 +1,429 @@
+---
+title: "nba_success_modeling"
+author: "Alex, Kayla, Matt"
+date: "4/23/2022"
+output: pdf_document
+---
+
+```{r, message=F, warning=F}
+library(boot)
+library(glmulti)
+library(MASS)
+library(arm)
+library(tidyverse)
+library(car)
+nba = read.csv("data/nba.csv")
+
+nrow(nba[!complete.cases(nba),])
+
+nba[!complete.cases(nba), c("t3p_made_per_game","t3p_percent")]
+
+```
+
+As we can see, the only columns with NA's are the total three point percentage when a player has made zero three pointers per game. I think it's reasonable to impute this value at zero. 
+
+```{r}
+nas = nba[!complete.cases(nba),]$t3p_percent
+
+zeros = rep(0, length(nas))
+
+nba[!complete.cases(nba),]$t3p_percent <- zeros
+
+nrow(nba[!complete.cases(nba),])
+```
+
+```{r, message=F}
+set.seed(149)
+
+nba_train = sample_n(nba, round(.75*nrow(nba)))
+
+nba_test = anti_join(nba, nba_train)
+
+nrow(inner_join(nba_train, nba_test)) == 0
+
+nrow(nba_train) + nrow(nba_test) == nrow(nba)
+```
+
+```{r}
+
+glm_init = glm(surv_5yrs ~ games_played + min_per_game + pts_per_game + fg_made_per_game + fg_attempts_per_game + fg_percent + t3p_made_per_game + t3p_attempts_per_game + t3p_percent + ft_made_per_game + ft_attempts_per_game + ft_percent + oreb_per_game + dreb_per_game +   assists_per_game + steals_per_game + blocked_shots_per_game + turnovers_per_game, data=nba_train, family=binomial)
+
+glm_interaction = glm(surv_5yrs~(games_played + min_per_game + pts_per_game +fg_made_per_game + fg_attempts_per_game + fg_percent + t3p_made_per_game +t3p_attempts_per_game + t3p_percent + ft_made_per_game + ft_attempts_per_game + ft_percent+ oreb_per_game + dreb_per_game + assists_per_game + steals_per_game +blocked_shots_per_game + turnovers_per_game)^2,data=nba_train, family = binomial)
+
+formula(glm_interaction)
+
+n = nrow(nba_train)
+
+#Stepwise WITH interaction
+
+stepaic = step(glm_init, 
+       scope = list(lower = as.formula("surv_5yrs ~ 1"), 
+                    upper = formula(glm_interaction)),
+       direction = "both",
+       k = 2,trace=0) 
+
+stepbic = step(glm_init, 
+       scope = list(lower = as.formula("surv_5yrs ~ 1"), 
+                    upper = formula(glm_interaction)),
+       direction = "both",
+       k = log(n),trace=0) 
+
+formula(stepaic)
+formula(stepbic)
+
+```
+
+
+```{r}
+glm_half = glm(surv_5yrs ~ games_played + min_per_game + pts_per_game + fg_made_per_game + fg_attempts_per_game + fg_percent + t3p_made_per_game + t3p_attempts_per_game + t3p_percent, data=nba_train, family=binomial)
+
+set.seed(149)
+nba.candidates.bic = glmulti(
+  formula(glm_half),
+  data = nba_train,
+  level = 1,
+  method = "h",
+  crit = "aic",
+  confsetsize = 1,     # select large size of candidates
+  plotty = F, report = F,
+  fitfunction = "glm",
+  family = binomial)
+
+nba.candidates.aic = glmulti(
+  formula(glm_half),
+  data = nba_train,
+  level = 1,
+  method = "h",
+  crit = "bic",
+  confsetsize = 1,     # select large size of candidates
+  plotty = F, report = F,
+  fitfunction = "glm",
+  family = binomial)
+
+```
+
+```{r}
+
+costfnc = function(y,p) sum(-2*(y*log(p) + (1-y)*log(1-p)))
+
+models = c(formula(glm_init), formula(glm_interaction), formula(stepaic),
+           formula(stepbic), formula(nba.candidates.aic@objects[[1]]),
+           formula(nba.candidates.bic@objects[[1]]))
+
+
+
+set.seed(149)  
+cost.vec = NULL
+for(k in 1:length(models)){  # takes a minute or two to run
+  cost.vec = c(cost.vec,
+  cv.glm(nba_train, 
+         glm(models[[k]],family=binomial,data=nba_train),
+         cost = costfnc, K = 10)$delta[1])
+}
+
+```
+
+
+```{r}
+
+nba.cross.val = glm(models[[which.min(cost.vec)]], data=nba_train, family = binomial)
+
+nba.cross.val$coefficients
+
+```
+
+Evaluate on test set:
+
+
+```{r}
+options(scipen = 9999)
+test_actual = nba_test$surv_5yrs
+costfnc2 = function(y,p) sum(-2*(y*log(p+0.000001) + (1-y)*log(1-p+0.000001)))
+
+preds_init = 1*(predict(glm_init, newdata = nba_test, type='response')>0.5)
+preds_int = 1*(predict(glm_interaction, newdata = nba_test, type='response')>0.5)
+preds_sa = 1*(predict(stepaic, newdata = nba_test, type='response')>0.5)
+preds_sb = 1*(predict(stepbic, newdata = nba_test, type='response')>0.5)
+preds_a_mul = 1*(predict(nba.candidates.aic@objects[[1]], 
+                       newdata = nba_test, type='response')>0.5)
+preds_b_mul = 1*(predict(nba.candidates.bic@objects[[1]], 
+                       newdata = nba_test, type='response')>0.5)
+
+test_dev = c(costfnc2(test_actual, preds_init),
+costfnc2(test_actual, preds_int),
+costfnc2(test_actual, preds_sa),
+costfnc2(test_actual, preds_sb),
+costfnc2(test_actual, preds_a_mul),
+costfnc2(test_actual, preds_b_mul))
+
+crossval_dev = cost.vec
+
+test_accs = c(mean(preds_init == test_actual),
+mean(preds_int == test_actual),
+mean(preds_sa == test_actual),
+mean(preds_sb == test_actual),
+mean(preds_a_mul == test_actual),
+mean(preds_b_mul == test_actual))
+
+dev_ratio = c(glm_init$deviance/glm_init$df.residual,
+              glm_interaction$deviance/glm_interaction$df.residual,
+              stepaic$deviance/stepaic$df.residual,
+              stepbic$deviance/stepaic$df.residual,
+              nba.candidates.aic@objects[[1]]$deviance/
+                nba.candidates.aic@objects[[1]]$df.residual,
+              nba.candidates.bic@objects[[1]]$deviance/
+                nba.candidates.bic@objects[[1]]$df.residual)
+#vif_over_10 = c((max(1*((vif(glm_init)^2)>10))==1),
+#(max(1*((vif(glm_interaction)^2)>10))==1),
+#(max(1*((vif(stepaic)^2)>10))==1),
+#(max(1*((vif(stepbic)^2)>10))==1),
+#(max(1*((vif(nba.candidates@objects[[1]])^2)>10))==1))
+
+res.df = round(data.frame(test_dev, test_accs, crossval_dev, dev_ratio, 
+           row.names = c("Initial Model", "Interaction Model",
+                         "Stepaic","Stepbic","Glmulti aic", "Glmulti bic")),4)
+
+res.df[order(res.df$test_accs, decreasing=T),] %>% 
+  kable(booktabs = TRUE,
+        caption = 'Comparing model performance',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+```
+
+
+```{r}
+library(mgcv)
+
+formula(stepbic)
+
+gam_model_bic = gam(surv_5yrs ~ s(games_played) + s(oreb_per_game) + s(ft_percent),
+                data=nba_train, family=binomial)
+
+
+preds_gam = 1*(predict(gam_model_bic, newdata = nba_test, type='response')>0.5)
+
+paste("gam bic test deviance:",costfnc2(test_actual, preds_gam))
+
+paste("gam bic test accuracy:", mean(preds_gam == test_actual))
+
+summary(gam_model_bic)
+plot(gam_model_bic, residuals = T, all.terms = T, shade = T, shade.col=2, pages=1)
+
+rbind(GamModel = c(round(costfnc2(test_actual, preds_gam),4),
+                round(mean(preds_gam == test_actual),4), "-","-"),res.df)%>% 
+  kable(booktabs = TRUE,
+        caption = 'Comparing model performance',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+
+
+```
+
+```{r, fig.height=18, fig.width=10}
+
+par(mfrow=c(7,2))
+
+##### Initial #####
+
+binnedplot(fitted(glm_init), residuals(glm_init,type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot initial")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(glm_init), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances initial")
+
+abline(h=1,lty=2,col="red")
+
+##### interaction #####
+
+binnedplot(fitted(glm_interaction), residuals(glm_interaction,type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot int model")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(glm_interaction), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances int model")
+
+abline(h=1,lty=2,col="red")
+
+##### AIC no int #####
+
+binnedplot(fitted(stepaic), residuals(stepaic,type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot Stepaic")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(stepaic), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances Stepaic")
+
+abline(h=1,lty=2,col="red")
+
+##### BIC no int #####
+
+binnedplot(fitted(stepbic), residuals(stepbic,type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot Stepbic")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(stepbic), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances Stepbic")
+
+abline(h=1,lty=2,col="red")
+
+##### GLMULTI #####
+
+binnedplot(fitted(nba.candidates.aic@objects[[1]]),
+           residuals(nba.candidates.aic@objects[[1]],type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot glmulti aic")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(nba.candidates.aic@objects[[1]]), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances glmulti aic")
+
+abline(h=1,lty=2,col="red")
+
+##### GLMULTI #####
+
+binnedplot(fitted(nba.candidates.bic@objects[[1]]), residuals(nba.candidates.bic@objects[[1]],type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot glmulti bic")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(nba.candidates.bic@objects[[1]]), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances glmulti bic")
+
+abline(h=1,lty=2,col="red")
+
+##### GAM #####
+
+binnedplot(fitted(gam_model_bic), residuals(gam_model_bic,type="response"),
+           xlab="fitted",
+           ylab="residuals",
+           pch=19, col.pts="red", cex.pts=1.5,
+           main="Fitted vs residual plot GAM")
+
+abline(h=0,lty=2,col="green")
+
+plot(cooks.distance(gam_model_bic), type="h", lwd=2,
+  xlab="Observation index",
+  ylab="Cook's distances",
+  main="Cook's distances GAM")
+
+abline(h=1,lty=2,col="red")
+
+```
+
+```{r chosen_outputs}
+
+# vif on full main-effects model & stepwise BIC
+
+car::vif(glm_init) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('variable') %>% 
+  kable(booktabs = TRUE, 
+        caption = 'Variance inflation factors for full model',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+car::vif(stepbic) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('variable') %>% 
+  kable(booktabs = TRUE, 
+        caption = 'Variance inflation factors for stepwise BIC model',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+car::vif(stepaic) %>% 
+  as.data.frame() %>% 
+  rownames_to_column('variable') %>% 
+  kable(booktabs = TRUE, 
+        caption = 'Variance inflation factors for stepwise AIC model',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+
+# displaying regression table for chosen model
+
+stepbic_refit <- glm(surv_5yrs ~ games_played + oreb_per_game + ft_percent,
+    data = nba_test, family = binomial)
+stargazer::stargazer(stepbic_refit, type = 'latex', header = FALSE,
+                     title = 'Stepwise BIC model output')
+
+# examining significance of non-linearities
+
+library(knitr)
+library(mgcv)
+summary(gam_model_bic)$s.table %>% 
+  kable(booktabs = TRUE,
+        caption = 'GAM model output',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+
+# LRT between GAM and step BIC
+
+anova(gam(formula = surv_5yrs ~ games_played + oreb_per_game + 
+            ft_percent, family = binomial, data = nba_train), 
+      gam(formula = surv_5yrs ~ s(games_played) + s(oreb_per_game) + 
+            s(ft_percent), family = binomial, data = nba_train),
+      test = 'Chisq') %>% 
+  stargazer::stargazer(header = FALSE)
+
+```
+
+```{r player_predictions}
+
+predict_subset <- subset(nba, nba$name %in% c('Stephen Curry', 'Karl-Anthony Towns', "Shaquille O'Neal*"))
+predict(stepbic, predict_subset, type = 'response')
+
+predict_subset %>% 
+  select(name, games_played, ft_percent, oreb_per_game, surv_5yrs) %>% 
+  mutate(predicted_prob = predict(stepbic, predict_subset, type = 'response')) %>% 
+  kable(booktabs = TRUE,
+        caption = 'Selected player predictions',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+
+# sensitivity and specificity
+
+actual_pred <- tibble(actual = nba$surv_5yrs, 
+       preds = as.numeric(predict(stepbic, nba, type = 'response')>=0.5))
+actual_pred %>% 
+  group_by(actual) %>% 
+  summarise(accuracy = mean(actual == preds)) %>% 
+  rename(surv_5yrs = actual) %>% 
+  kable(booktabs = TRUE,
+        caption = 'Predictive accuracy by outcomes across entire dataset',
+        format = 'latex') %>% 
+  kableExtra::kable_minimal()
+
+```
+
